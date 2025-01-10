@@ -4,14 +4,10 @@ import cv2
 import pytesseract
 from transformers import MarianMTModel, MarianTokenizer
 import numpy as np
-from PIL import Image
-import pytesseract
+from PIL import Image, ImageDraw, ImageFont
 
 # Spécifiez le chemin vers l'exécutable Tesseract (pour Windows)
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# Pour Linux/MacOS, tesseract est souvent déjà dans PATH, donc pas besoin de configuration
-# pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # Exemple pour Linux
 
 # Charger le modèle YOLO
 model = YOLO('D:/Down/best.pt')
@@ -25,19 +21,16 @@ translator = MarianMTModel.from_pretrained(model_name)
 def translate_text(text):
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
     outputs = translator.generate(**inputs)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-
+    return tokenizer.decode(outputs[0], skip_special_tokens=True).upper()  # Convertir en MAJUSCULES
 
 # Fonction pour ajuster le texte au rectangle
-def wrap_text(text, box_width, font, font_scale, thickness):
+def wrap_text(text, box_width, font, font_size):
     lines = []
     words = text.split()
     line = ""
     for word in words:
         temp_line = f"{line} {word}".strip()
-        text_size = cv2.getTextSize(temp_line, font, font_scale, thickness)[0]
-        if text_size[0] > box_width:
+        if font.getsize(temp_line)[0] > box_width:
             lines.append(line.strip())
             line = word
         else:
@@ -53,10 +46,18 @@ uploaded_file = st.file_uploader("Téléchargez une page de manga", type=["jpg",
 
 if uploaded_file is not None:
     # Charger l'image
-    image = np.array(Image.open(uploaded_file))
+    original_image = np.array(Image.open(uploaded_file))
+    image_with_boxes = original_image.copy()  # Image pour les bulles entourées
+    pil_image_with_translation = Image.fromarray(original_image)  # Utiliser PIL pour l'édition
+    draw = ImageDraw.Draw(pil_image_with_translation)
+
+    # Charger une police compatible Unicode
+    font_path = "arial.ttf"  # Remplacez par le chemin de votre police si nécessaire
+    font_size = 20
+    font = ImageFont.truetype(font_path, font_size)
 
     # Détecter les bulles avec YOLO
-    results = model.predict(source=image, conf=0.25)
+    results = model.predict(source=original_image, conf=0.25)
 
     for result in results:
         for box, conf in zip(result.boxes.xyxy, result.boxes.conf):  # Récupérer les coordonnées et scores
@@ -65,12 +66,18 @@ if uploaded_file is not None:
 
             x1, y1, x2, y2 = map(int, box[:4])  # Convertir les coordonnées en entiers
 
+            # Dessiner les rectangles autour des bulles sur image_with_boxes
+            cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), thickness=2)
+
             # Garder la taille originale pour l'extraction du texte
-            cropped_bubble = image[y1:y2, x1:x2]
+            cropped_bubble = original_image[y1:y2, x1:x2]
             cropped_bubble_gray = cv2.cvtColor(cropped_bubble, cv2.COLOR_BGR2GRAY)
 
             # Extraire le texte avec pytesseract
-            text = pytesseract.image_to_string(cropped_bubble_gray)
+            text = pytesseract.image_to_string(cropped_bubble_gray).strip()
+
+            if len(text) < 1:  # Ignore les textes trop courts
+                continue
 
             # Traduire le texte extrait
             translated_text = translate_text(text)
@@ -78,39 +85,38 @@ if uploaded_file is not None:
             # Ajuster la taille des rectangles à 75% pour affichage
             box_width = x2 - x1
             box_height = y2 - y1
-            reduced_x1 = x1 + box_width // 8
-            reduced_y1 = y1 + box_height // 8
-            reduced_x2 = x2 - box_width // 8
-            reduced_y2 = y2 - box_height // 8
+            reduced_x1 = x1 + box_width // 6
+            reduced_y1 = y1 + box_height // 6
+            reduced_x2 = x2 - box_width // 6
+            reduced_y2 = y2 - box_height // 6
 
             # Diviser le texte traduit en lignes pour qu'il tienne dans le rectangle réduit
-            font_scale = 0.5
-            thickness = 1
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            reduced_box_width = reduced_x2 - reduced_x1
-            wrapped_text = wrap_text(translated_text, reduced_box_width, font, font_scale, thickness)
+            wrapped_text = wrap_text(translated_text, reduced_x2 - reduced_x1, font, font_size)
 
             # Calculer la hauteur totale nécessaire pour le texte
-            line_height = cv2.getTextSize("Test", font, font_scale, thickness)[0][1] + 5
+            line_height = font.getsize("Test")[1] + 5
             total_text_height = len(wrapped_text) * line_height
 
-            # Ajuster la taille de la police si le texte dépasse verticalement
-            if total_text_height > (reduced_y2 - reduced_y1):
-                font_scale *= (reduced_y2 - reduced_y1) / total_text_height
-                wrapped_text = wrap_text(translated_text, reduced_box_width, font, font_scale, thickness)
+            # Centrer verticalement
+            current_y = reduced_y1 + (reduced_y2 - reduced_y1 - total_text_height) // 2
 
-            # Supprimer l'ancien texte (remplir le rectangle réduit avec du blanc)
-            cv2.rectangle(image, (reduced_x1, reduced_y1), (reduced_x2, reduced_y2), (255, 255, 255), thickness=-1)
+            # Dessiner un rectangle blanc derrière le texte (agrandi)
+            padding_x = 6  # Ajouter un espace horizontal
+            padding_y = 6  # Ajouter un espace vertical
+            text_background_y1 = max(reduced_y1 - padding_y, y1)
+            text_background_y2 = min(reduced_y2 + padding_y, y2)
+            draw.rectangle(
+                [reduced_x1 - padding_x, text_background_y1, reduced_x2 + padding_x, text_background_y2],
+                fill="white"
+            )
 
-            # Ajouter le texte traduit ligne par ligne dans le rectangle réduit
-            current_y = reduced_y1 + (reduced_y2 - reduced_y1 - total_text_height) // 2  # Centrer verticalement
+            # Ajouter le texte traduit ligne par ligne
             for line in wrapped_text:
-                text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
-                text_x = reduced_x1 + (reduced_box_width - text_size[0]) // 2  # Centrer horizontalement
-                cv2.putText(image, line, (text_x, current_y), font, font_scale, (0, 0, 0), thickness)
+                text_width, text_height = font.getsize(line)
+                text_x = reduced_x1 + (reduced_x2 - reduced_x1 - text_width) // 2  # Centrer horizontalement
+                draw.text((text_x, current_y), line, font=font, fill="black")
                 current_y += line_height
 
-    # Sauvegarder et afficher l'image annotée
-    annotated_image_path = 'annotated_image_with_translation.jpg'
-    cv2.imwrite(annotated_image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-    st.image(image, caption="Image avec texte traduit", use_column_width=True)
+    # Afficher les deux images
+    st.image(image_with_boxes, caption="Image avec bulles détectées", use_column_width=True)
+    st.image(pil_image_with_translation, caption="Image avec texte traduit", use_column_width=True)
